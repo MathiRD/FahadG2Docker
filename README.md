@@ -1,114 +1,142 @@
-# Aluno 1 (Matheus Durigon / 1134695) — Produtor (Kafka + Faker/Python)
+# Aluno 2 — Stream & Cache (Flink + Valkey)
 
 ## Objetivo
-Garantir que o fluxo de dados exista e seja estável: criar o tópico `vendas_raw`
-no Kafka e enviar continuamente transações sintéticas de e-commerce — incluindo
-algumas de **alto valor** (> 500) para acionar os alertas de fraude (Aluno 2).
+Capturar transações críticas em tempo real: um job no Apache Flink consome o
+tópico `vendas_raw`, filtra apenas as transações de **alto valor** (`valor > 500`)
+e as grava imediatamente no **Valkey** (Redis) como chave-valor
+(`fraude:<id_transacao>`).
 
 ## Arquivos desta parte
 ```
-aluno1-producer/
-├── Dockerfile          # imagem Python 3.11 + dependências
-├── requirements.txt    # confluent-kafka + Faker
-└── producer.py         # gerador e enviador de transações
+aluno2-flink/
+├── Dockerfile          # Flink 1.18 + Python/PyFlink + conector Kafka + redis
+├── requirements.txt    # apache-flink + redis
+└── fraude_job.py       # job PyFlink (DataStream API)
 ```
 
 ## Como funciona
-1. `producer.py` espera o Kafka ficar disponível (`AdminClient.list_topics`).
-2. Cria o tópico `vendas_raw` (3 partições) caso ainda não exista.
-3. Em loop, gera uma transação a cada `INTERVALO_SEGUNDOS` (padrão: 1s) e a publica.
-   - ~15% das mensagens têm `valor_total` entre 500,01 e 8000,00 (alto valor).
-   - A `key` da mensagem é o `id_cliente`.
+1. A imagem (`Dockerfile`) parte de `flink:1.18.1`, instala Python/PyFlink,
+   o cliente `redis` e baixa o **conector Kafka** para `/opt/flink/lib`
+   (assim o `KafkaSource` funciona sem `add_jars` no código).
+2. O `fraude_job.py`:
+   - lê todas as mensagens de `vendas_raw` (offset `earliest`);
+   - filtra `valor_total > 500`;
+   - grava cada alerta no Valkey como um **hash** na chave `fraude:<id_transacao>`
+     (com TTL de 24h);
+   - também imprime os alertas no log (`.print()`), visível no TaskManager.
+3. O serviço `flink-job-submitter` (definido no compose) espera Kafka + JobManager
+   subirem e então submete o job com:
+   ```
+   flink run -d -m jobmanager:8081 -py /opt/flink/jobs/fraude_job.py
+   ```
 
-### Exemplo de mensagem produzida
-```json
-{
-  "id_transacao": "62d9830f-179f-4894-87dc-4244984c1594",
-  "id_cliente": 987,
-  "valor_total": 450.50,
-  "categoria": "Eletrônicos",
-  "timestamp": "2026-06-15T18:00:00Z"
-}
-```
-
-## Variáveis de ambiente
-| Variável             | Padrão        | Descrição                                   |
-|----------------------|---------------|---------------------------------------------|
-| `KAFKA_BOOTSTRAP`    | `kafka:9092`  | Endereço do broker Kafka                     |
-| `TOPIC`              | `vendas_raw`  | Tópico de destino                            |
-| `INTERVALO_SEGUNDOS` | `1`           | Intervalo entre envios (em segundos)         |
+## Variáveis de ambiente (com padrões já embutidos no job)
+| Variável            | Padrão                       | Descrição                          |
+|---------------------|------------------------------|------------------------------------|
+| `KAFKA_BOOTSTRAP`   | `kafka:9092`                 | Broker Kafka                       |
+| `TOPIC`             | `vendas_raw`                 | Tópico de origem                   |
+| `GROUP_ID`          | `flink-fraude-alto-valor`    | Consumer group                     |
+| `REDIS_HOST`        | `valkey`                     | Host do Valkey/Redis               |
+| `REDIS_PORT`        | `6379`                       | Porta do Valkey/Redis              |
+| `LIMITE_ALTO_VALOR` | `500`                        | Limite para considerar "alto valor"|
+| `TTL_SEGUNDOS`      | `86400`                      | Expiração das chaves no Redis      |
 
 ## Trecho do `docker-compose.yml` referente a esta parte
 > O `docker-compose.yml` fica na **raiz do projeto** e é commitado pelo
-> integrador. Este trecho é só para você entender como o seu serviço é ligado.
+> integrador. Os três serviços abaixo (jobmanager, taskmanager e o submitter)
+> usam a **mesma imagem** construída a partir de `./aluno2-flink`.
 
 ```yaml
-  kafka:
-    image: confluentinc/cp-kafka:7.6.1
-    hostname: kafka
-    container_name: kafka
-    ports:
-      - "29092:29092"
-    environment:
-      KAFKA_NODE_ID: 1
-      KAFKA_PROCESS_ROLES: 'broker,controller'
-      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:29093'
-      KAFKA_LISTENERS: 'PLAINTEXT://kafka:9092,CONTROLLER://kafka:29093,PLAINTEXT_HOST://0.0.0.0:29092'
-      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092'
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
-      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
-      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
-      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
-    healthcheck:
-      test: ["CMD-SHELL", "kafka-topics --bootstrap-server kafka:9092 --list || exit 1"]
-      interval: 10s
-      timeout: 10s
-      retries: 15
-
-  kafka-ui:
-    image: ghcr.io/kafbat/kafka-ui:latest
-    container_name: kafka-ui
+  jobmanager:
+    build: ./aluno2-flink
+    image: ecommerce-flink:1.18
+    container_name: jobmanager
+    hostname: jobmanager
     depends_on:
       - kafka
     ports:
-      - "8090:8080"
+      - "8082:8081"     # Flink Dashboard -> http://localhost:8082
+    command: jobmanager
     environment:
-      KAFKA_CLUSTERS_0_NAME: local
-      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
-      DYNAMIC_CONFIG_ENABLED: 'true'
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        parallelism.default: 1
 
-  producer:
-    build: ./aluno1-producer
-    image: ecommerce-producer:latest
-    container_name: producer
+  taskmanager:
+    build: ./aluno2-flink
+    image: ecommerce-flink:1.18
+    container_name: taskmanager
     depends_on:
-      kafka:
-        condition: service_healthy
+      - jobmanager
+    command: taskmanager
     environment:
-      KAFKA_BOOTSTRAP: kafka:9092
-      TOPIC: vendas_raw
-      INTERVALO_SEGUNDOS: "1"
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 2
+        parallelism.default: 1
+
+  flink-job-submitter:
+    build: ./aluno2-flink
+    image: ecommerce-flink:1.18
+    container_name: flink-job-submitter
+    depends_on:
+      - jobmanager
+      - taskmanager
+      - kafka
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        echo "Aguardando o Kafka (porta 9092)..."
+        until (echo > /dev/tcp/kafka/9092) 2>/dev/null; do sleep 3; done
+        echo "Aguardando o Flink JobManager (porta 8081)..."
+        until (echo > /dev/tcp/jobmanager/8081) 2>/dev/null; do sleep 3; done
+        echo "Tudo pronto. Submetendo o job de fraude ao Flink..."
+        sleep 5
+        /opt/flink/bin/flink run -d -m jobmanager:8081 -py /opt/flink/jobs/fraude_job.py \
+          && echo "OK: job submetido." \
+          || (echo "Falha ao submeter. Vai reiniciar e tentar de novo." && exit 1)
     restart: on-failure
+
+  valkey:
+    image: valkey/valkey:8
+    container_name: valkey
+    ports:
+      - "6379:6379"
+
+  redisinsight:
+    image: redis/redisinsight:latest
+    container_name: redisinsight
+    depends_on:
+      - valkey
+    ports:
+      - "5540:5540"     # Redis Insight -> http://localhost:5540
 ```
 
-## Como subir só esta parte (para testar isolado)
+## Como subir só esta parte (depende do Aluno 1 produzindo dados)
 ```bash
 # a partir da raiz do projeto
-docker compose up --build kafka kafka-ui producer
+docker compose up --build kafka producer jobmanager taskmanager flink-job-submitter valkey redisinsight
 ```
 
 ## Validação (evidência para entregar)
-1. Abra o **KafBat UI**: <http://localhost:8090>
-2. Vá em **Topics → `vendas_raw`**.
-3. Aba **Messages**: veja as mensagens chegando em tempo real.
-4. Tire prints mostrando o volume crescendo e o conteúdo JSON das mensagens.
+1. **Flink Dashboard**: <http://localhost:8082> → o job `fraude-alto-valor`
+   deve aparecer com status **RUNNING**. Tire o print.
+2. **Redis Insight**: <http://localhost:5540>
+   - Na primeira vez, adicione o banco: **Add Redis database** →
+     Host `valkey`, Port `6379` (sem senha).
+   - Veja as chaves `fraude:*` aparecendo e o conteúdo (hash) de cada alerta.
+   - Tire prints mostrando os alertas armazenados.
+
+## Observações
+- O job lê a partir do `earliest`. Em uma reinicialização sem checkpoints ele
+  reprocessa as mensagens, mas como a chave no Redis é `fraude:<id_transacao>`,
+  a gravação é **idempotente** (não duplica).
 
 ## Logs úteis
 ```bash
-docker compose logs -f producer
+docker compose logs -f flink-job-submitter   # confirmação do submit
+docker compose logs -f taskmanager           # alertas impressos pelo job
 ```
