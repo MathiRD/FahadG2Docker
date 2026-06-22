@@ -1,4 +1,4 @@
-# Aluno 1 — Produtor (Kafka + Faker/Python)
+# Aluno 1 (Matheus Durigon / 1134695) — Produtor (Kafka + Faker/Python)
 
 ## Objetivo
 Garantir que o fluxo de dados exista e seja estável: criar o tópico `vendas_raw`
