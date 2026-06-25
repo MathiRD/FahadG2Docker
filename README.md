@@ -1,142 +1,244 @@
-# Aluno 2 — Stream & Cache (Flink + Valkey)
+# Sistema de Alertas e Analytics de E-commerce — Pipeline Final (G2)
 
-## Objetivo
-Capturar transações críticas em tempo real: um job no Apache Flink consome o
-tópico `vendas_raw`, filtra apenas as transações de **alto valor** (`valor > 500`)
-e as grava imediatamente no **Valkey** (Redis) como chave-valor
-(`fraude:<id_transacao>`).
+Pipeline de Big Data que monitora transações de e-commerce em tempo real para:
+- **detectar compras de alto valor** (time de fraude) — via Flink + Valkey/Redis;
+- **persistir o histórico bruto** — via MongoDB (data lake NoSQL);
+- **consolidar relatórios agregados** (time de negócios) — via Airflow + Postgres.
 
-## Arquivos desta parte
+Tudo orquestrado com **Docker Compose**.
+
+> **Disciplina:** Big Data — Prof. Fahad Kalil — ATITUS Educação
+
+---
+
+## Equipe
+
+| Aluno | Nome                       | RA        | Responsabilidade                       |
+|-------|----------------------------|-----------|----------------------------------------|
+| 1     | Matheus Durigon Rodrigues  | 1134695   | Produtor (Kafka + Faker)               |
+| 2     | Erick De Nardi             | 1134724   | Stream & Cache (Flink + Valkey)        |
+| 3     | Luis Zanin                 | 1136493   | Data Lake NoSQL (MongoDB)              |
+| 4     | João Inácio                | 1135445   | Orquestração (Airflow + Postgres)      |
+
+---
+
+## Arquitetura
+
 ```
-aluno2-flink/
-├── Dockerfile          # Flink 1.18 + Python/PyFlink + conector Kafka + redis
-├── requirements.txt    # apache-flink + redis
-└── fraude_job.py       # job PyFlink (DataStream API)
-```
-
-## Como funciona
-1. A imagem (`Dockerfile`) parte de `flink:1.18.1`, instala Python/PyFlink,
-   o cliente `redis` e baixa o **conector Kafka** para `/opt/flink/lib`
-   (assim o `KafkaSource` funciona sem `add_jars` no código).
-2. O `fraude_job.py`:
-   - lê todas as mensagens de `vendas_raw` (offset `earliest`);
-   - filtra `valor_total > 500`;
-   - grava cada alerta no Valkey como um **hash** na chave `fraude:<id_transacao>`
-     (com TTL de 24h);
-   - também imprime os alertas no log (`.print()`), visível no TaskManager.
-3. O serviço `flink-job-submitter` (definido no compose) espera Kafka + JobManager
-   subirem e então submete o job com:
-   ```
-   flink run -d -m jobmanager:8081 -py /opt/flink/jobs/fraude_job.py
-   ```
-
-## Variáveis de ambiente (com padrões já embutidos no job)
-| Variável            | Padrão                       | Descrição                          |
-|---------------------|------------------------------|------------------------------------|
-| `KAFKA_BOOTSTRAP`   | `kafka:9092`                 | Broker Kafka                       |
-| `TOPIC`             | `vendas_raw`                 | Tópico de origem                   |
-| `GROUP_ID`          | `flink-fraude-alto-valor`    | Consumer group                     |
-| `REDIS_HOST`        | `valkey`                     | Host do Valkey/Redis               |
-| `REDIS_PORT`        | `6379`                       | Porta do Valkey/Redis              |
-| `LIMITE_ALTO_VALOR` | `500`                        | Limite para considerar "alto valor"|
-| `TTL_SEGUNDOS`      | `86400`                      | Expiração das chaves no Redis      |
-
-## Trecho do `docker-compose.yml` referente a esta parte
-> O `docker-compose.yml` fica na **raiz do projeto** e é commitado pelo
-> integrador. Os três serviços abaixo (jobmanager, taskmanager e o submitter)
-> usam a **mesma imagem** construída a partir de `./aluno2-flink`.
-
-```yaml
-  jobmanager:
-    build: ./aluno2-flink
-    image: ecommerce-flink:1.18
-    container_name: jobmanager
-    hostname: jobmanager
-    depends_on:
-      - kafka
-    ports:
-      - "8082:8081"     # Flink Dashboard -> http://localhost:8082
-    command: jobmanager
-    environment:
-      - |
-        FLINK_PROPERTIES=
-        jobmanager.rpc.address: jobmanager
-        parallelism.default: 1
-
-  taskmanager:
-    build: ./aluno2-flink
-    image: ecommerce-flink:1.18
-    container_name: taskmanager
-    depends_on:
-      - jobmanager
-    command: taskmanager
-    environment:
-      - |
-        FLINK_PROPERTIES=
-        jobmanager.rpc.address: jobmanager
-        taskmanager.numberOfTaskSlots: 2
-        parallelism.default: 1
-
-  flink-job-submitter:
-    build: ./aluno2-flink
-    image: ecommerce-flink:1.18
-    container_name: flink-job-submitter
-    depends_on:
-      - jobmanager
-      - taskmanager
-      - kafka
-    entrypoint: /bin/bash
-    command:
-      - -c
-      - |
-        echo "Aguardando o Kafka (porta 9092)..."
-        until (echo > /dev/tcp/kafka/9092) 2>/dev/null; do sleep 3; done
-        echo "Aguardando o Flink JobManager (porta 8081)..."
-        until (echo > /dev/tcp/jobmanager/8081) 2>/dev/null; do sleep 3; done
-        echo "Tudo pronto. Submetendo o job de fraude ao Flink..."
-        sleep 5
-        /opt/flink/bin/flink run -d -m jobmanager:8081 -py /opt/flink/jobs/fraude_job.py \
-          && echo "OK: job submetido." \
-          || (echo "Falha ao submeter. Vai reiniciar e tentar de novo." && exit 1)
-    restart: on-failure
-
-  valkey:
-    image: valkey/valkey:8
-    container_name: valkey
-    ports:
-      - "6379:6379"
-
-  redisinsight:
-    image: redis/redisinsight:latest
-    container_name: redisinsight
-    depends_on:
-      - valkey
-    ports:
-      - "5540:5540"     # Redis Insight -> http://localhost:5540
+                           ┌─────────────────────────────────────────┐
+                           │                 KAFKA                     │
+   Aluno 1                 │              tópico: vendas_raw           │
+ ┌──────────┐   produz     │                                           │
+ │ producer │ ───────────► │  ◄── KafBat UI (visualização)             │
+ │ (Python  │              └───────┬───────────────────────┬──────────┘
+ │  +Faker) │                      │                        │
+ └──────────┘            consome   │                        │  consome
+                          (todas)  │                        │  (todas)
+                                   ▼                        ▼
+                        Aluno 2                       Aluno 3
+                  ┌──────────────────┐         ┌──────────────────┐
+                  │  Flink job        │         │  mongo-consumer   │
+                  │  filtra > 500     │         │  (Python)         │
+                  └────────┬─────────┘         └────────┬─────────┘
+                           │ grava alerta               │ insere documento
+                           ▼                            ▼
+                  ┌──────────────────┐         ┌──────────────────┐
+                  │  Valkey (Redis)   │         │  MongoDB          │
+                  │  fraude:<id>      │         │  ecommerce.       │
+                  │  ◄ Redis Insight  │         │   transacoes      │
+                  └──────────────────┘         │  ◄ Mongo Express  │
+                                               └────────┬─────────┘
+                                                        │ lê histórico
+                                          Aluno 4       ▼
+                                     ┌─────────────────────────────┐
+                                     │  Airflow DAG (a cada 2 min)  │
+                                     │  faturamento por categoria   │
+                                     └──────────────┬──────────────┘
+                                                    │ upsert agregados
+                                                    ▼
+                                          ┌──────────────────┐
+                                          │  Postgres         │
+                                          │  ecommerce.       │
+                                          │  faturamento_     │
+                                          │   por_categoria   │
+                                          │  ◄ PgAdmin        │
+                                          └──────────────────┘
 ```
 
-## Como subir só esta parte (depende do Aluno 1 produzindo dados)
+---
+
+## Pré-requisitos
+- **Docker** e **Docker Compose** (v2, comando `docker compose`).
+- **Memória**: recomenda-se **pelo menos 8 GB** disponíveis para o Docker
+  (são ~16 containers, incluindo Flink e Airflow). Em Docker Desktop, ajuste
+  em *Settings → Resources*.
+- Conexão à internet na primeira subida (download das imagens e do conector
+  Kafka do Flink).
+
+---
+
+## Como executar (tudo de uma vez)
+
+Na raiz do projeto:
+
 ```bash
-# a partir da raiz do projeto
-docker compose up --build kafka producer jobmanager taskmanager flink-job-submitter valkey redisinsight
+docker compose up --build
 ```
 
-## Validação (evidência para entregar)
-1. **Flink Dashboard**: <http://localhost:8082> → o job `fraude-alto-valor`
-   deve aparecer com status **RUNNING**. Tire o print.
-2. **Redis Insight**: <http://localhost:5540>
-   - Na primeira vez, adicione o banco: **Add Redis database** →
-     Host `valkey`, Port `6379` (sem senha).
-   - Veja as chaves `fraude:*` aparecendo e o conteúdo (hash) de cada alerta.
-   - Tire prints mostrando os alertas armazenados.
+A primeira execução demora alguns minutos (build das imagens). A ordem de
+inicialização é controlada por `depends_on`/healthchecks:
+- o **producer** só inicia quando o Kafka está saudável;
+- o **flink-job-submitter** espera Kafka + JobManager e então submete o job;
+- o **Airflow** só inicia depois que o `airflow-init` migra o banco e cria o usuário.
 
-## Observações
-- O job lê a partir do `earliest`. Em uma reinicialização sem checkpoints ele
-  reprocessa as mensagens, mas como a chave no Redis é `fraude:<id_transacao>`,
-  a gravação é **idempotente** (não duplica).
-
-## Logs úteis
+Para parar:
 ```bash
-docker compose logs -f flink-job-submitter   # confirmação do submit
-docker compose logs -f taskmanager           # alertas impressos pelo job
+docker compose down
 ```
+
+Para parar **e apagar os volumes** (recomeçar do zero — Mongo, Postgres, etc.):
+```bash
+docker compose down -v
+```
+
+---
+
+## Acessos (portas e credenciais)
+
+| Serviço            | URL                              | Login / Observação                                  |
+|--------------------|----------------------------------|-----------------------------------------------------|
+| **KafBat UI**      | <http://localhost:8090>          | sem login                                            |
+| **Flink Dashboard**| <http://localhost:8082>          | sem login                                            |
+| **Redis Insight**  | <http://localhost:5540>          | adicione o DB: host `valkey`, porta `6379`           |
+| **Mongo Express**  | <http://localhost:8081>          | sem login (auth desativada)                          |
+| **Airflow UI**     | <http://localhost:8085>          | `admin` / `admin`                                    |
+| **PgAdmin**        | <http://localhost:5050>          | `admin@admin.com` / `admin` (senha do PG: `airflow`) |
+
+Portas de dados (caso queira conectar do host):
+| Serviço     | Porta host | Credenciais            |
+|-------------|------------|------------------------|
+| Kafka       | `29092`    | —                      |
+| Valkey      | `6379`     | —                      |
+| MongoDB     | `27017`    | `root` / `example`     |
+| Postgres    | `5432`     | `airflow` / `airflow`  |
+
+---
+
+## Estrutura do repositório
+
+```
+ecommerce-pipeline/
+├── docker-compose.yml            # orquestra TODOS os serviços
+├── .gitignore
+├── README.md                     # este arquivo
+│
+├── aluno1-producer/              # Aluno 1 — Produtor (Kafka + Faker)
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   ├── producer.py
+│   └── README.md
+│
+├── aluno2-flink/                 # Aluno 2 — Stream & Cache (Flink + Valkey)
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   ├── fraude_job.py
+│   └── README.md
+│
+├── aluno3-mongo/                 # Aluno 3 — Data Lake NoSQL (MongoDB)
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   ├── consumer.py
+│   └── README.md
+│
+├── aluno4-airflow/               # Aluno 4 — Orquestração (Airflow + Postgres)
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   ├── dags/
+│   │   └── faturamento_dag.py
+│   └── README.md
+│
+├── postgres/
+│   └── init/
+│       └── 01-create-ecommerce-db.sql   # cria o banco "ecommerce" + tabela
+│
+├── pgadmin/
+│   └── servers.json              # pré-cadastro do servidor no PgAdmin
+│
+└── evidencias/                   # prints exigidos na entrega
+    └── README.md                 # checklist de evidências
+```
+
+---
+
+## Divisão por aluno (o que cada um faz / commita)
+
+> O `docker-compose.yml`, a pasta `postgres/`, a pasta `pgadmin/`, este `README.md`
+> e o `.gitignore` são a **"cola"** do projeto e ficam na raiz. Cada `alunoN-*/README.md`
+> traz o trecho do compose relevante para aquela parte, para o aluno entender como o
+> serviço dele é ligado.
+
+| Aluno | Nome                      | RA      | Pasta/arquivos que commita                          |
+|-------|---------------------------|---------|-----------------------------------------------------|
+| 1     | Matheus Durigon Rodrigues | 1134695 | `aluno1-producer/`                                  |
+| 2     | Erick De Nardi            | 1134724 | `aluno2-flink/`                                     |
+| 3     | Luis Zanin                | 1136493 | `aluno3-mongo/`                                     |
+| 4     | João Inácio               | 1135445 | `aluno4-airflow/`                                   |
+| —     | Integração (compartilhado)| —       | `docker-compose.yml`, `postgres/`, `pgadmin/`, `README.md`, `.gitignore` |
+
+---
+
+## Roteiro de validação (para gerar as evidências)
+
+1. **Aluno 1 — KafBat UI** (<http://localhost:8090>): tópico `vendas_raw`, aba
+   *Messages*, mensagens chegando em tempo real.
+2. **Aluno 2 — Flink Dashboard** (<http://localhost:8082>): job `fraude-alto-valor`
+   com status **RUNNING**. **Redis Insight** (<http://localhost:5540>): chaves
+   `fraude:*` com os alertas.
+3. **Aluno 3 — Mongo Express** (<http://localhost:8081>): banco `ecommerce`,
+   coleção `transacoes`, volume de documentos crescendo.
+4. **Aluno 4 — Airflow UI** (<http://localhost:8085>, `admin`/`admin`): DAG
+   `faturamento_por_categoria` verde + logs. **PgAdmin** (<http://localhost:5050>):
+   ```sql
+   SELECT * FROM faturamento_por_categoria ORDER BY total_faturado DESC;
+   ```
+
+Deixe o pipeline rodando alguns minutos antes de capturar — a DAG roda a cada 2
+minutos. Salve os prints em `evidencias/` (ver checklist lá).
+
+---
+
+## Solução de problemas (troubleshooting)
+
+- **Erros estranhos no Kafka/Flink/Mongo após mexer no projeto**: provavelmente
+  um volume antigo. Recomece limpo:
+  ```bash
+  docker compose down -v
+  docker compose up --build
+  ```
+- **Build do Flink falha com `ReadTimeoutError` (pip)**: conexão lenta baixando
+  o pacote grande do PyFlink. O `aluno2-flink/Dockerfile` já usa
+  `--timeout=1000 --retries=10` no `pip install` para tolerar isso. Se ainda
+  assim falhar, use uma rede mais estável e reconstrua **só** a imagem do Flink:
+  ```bash
+  docker compose build jobmanager
+  ```
+- **Erro `401 Unauthorized` / repositório "is not signed" no build**: a rede tem
+  um proxy que exige autenticação. Use uma rede sem proxy ou configure as
+  credenciais do proxy em *Docker Desktop → Settings → Resources → Proxies*.
+- **O job do Flink não aparece no Dashboard**: veja os logs do submitter —
+  ele espera Kafka + JobManager e tenta de novo automaticamente:
+  ```bash
+  docker compose logs -f flink-job-submitter
+  ```
+- **PgAdmin não conecta**: o servidor já vem cadastrado; ao abrir, informe a
+  senha do Postgres (`airflow`). Confirme que o `postgres` está *healthy*:
+  ```bash
+  docker compose ps
+  ```
+- **Airflow demora a aparecer**: é normal na primeira vez (migração do banco).
+  Acompanhe:
+  ```bash
+  docker compose logs -f airflow-init
+  docker compose logs -f airflow-webserver
+  ```
+- **Pouca memória**: se containers ficarem reiniciando, aumente a RAM do Docker.
