@@ -1,10 +1,4 @@
-FROM python:3.11-slim
+FROM apache/airflow:2.9.3
 
-WORKDIR /app
-
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY consumer.py .
-
-CMD ["python", "-u", "consumer.py"]
+COPY requirements.txt /requirements.txt
+RUN pip install --no-cache-dir -r /requirements.txt

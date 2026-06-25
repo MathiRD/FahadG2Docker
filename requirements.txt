@@ -1,2 +1,2 @@
-confluent-kafka==2.5.0
 pymongo==4.7.2
+psycopg2-binary==2.9.9
