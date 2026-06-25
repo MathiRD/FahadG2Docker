@@ -1,2 +1,2 @@
-apache-flink==1.18.1
-redis==5.0.4
+confluent-kafka==2.5.0
+pymongo==4.7.2
